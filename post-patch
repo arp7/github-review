@@ -1,0 +1,176 @@
+#!/usr/bin/perl
+
+#   Copyright 2014 arp@apache.org
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+# Commit a patch to a new branch in a remote repo for code review.
+# This can be useful if you want to use e.g. Github webUI for code reviews.
+
+use strict;
+use warnings;
+
+use File::Basename;
+use File::Copy;
+use File::Grep "fgrep";
+use File::Spec;
+require LWP::UserAgent;
+
+
+# Defaults, can be changed using command line options.
+my $upstream_repo   = "apache";
+my $cloned_repo     = "myapache";
+my $upstream_branch = "trunk";
+my $verbose_output = 0;
+
+# Download the given URL to the given local file.
+# Fetching with ua requires Mozilla::CA for https URLs.
+# It can be installed via CPAN as following:
+#  cpan App::cpanminus
+#  sudo cpanm Mozilla::CA
+#
+sub download_file($;$) {
+  my $url = shift;
+  my $local_file = shift;
+
+  # Local file, just perform a file copy.
+  if ($url !~ m|^http|) {
+    copy($url, $local_file) or die " >> Failed to copy patch file: $!";
+    return;
+  }
+  my $ua = LWP::UserAgent->new;
+  $ua->timeout(10);
+  my $patch_data = $ua->get($url) or die "Failed to fetch $url: $!";
+  my $MYFILE;
+  open(MYFILE, ">$local_file") or die "Failed to open $local_file: $!";
+  print MYFILE $patch_data->decoded_content;
+  close (MYFILE);
+}
+
+
+sub usage() {
+  printf STDERR "\n  Commit a patch to a new remote branch for code review.\n\n";
+  printf STDERR "  Usage: %s [--upstream <upstream>] [--fork <forked>]\n", basename($0);
+  printf STDERR "                    [--branch <branch>] <patch URL>\n\n";
+  printf STDERR "     <upstream> : The name of the upstream repo remote. Default 'apache'\n";
+  printf STDERR "     <forked>   : The name of the forked repo remote. Default 'myapache'\n";
+  printf STDERR "     <branch>   : Remote branch in upstream repo to apply the patch.\n";
+  printf STDERR "                  Default 'trunk'\n\n";
+  exit 1;
+}
+
+sub parse_args() {
+  while (1) {
+    if ($ARGV[0] =~ m/^--(\w+)$/) {
+      shift @ARGV;
+      if ($1 eq lc("up") || $1 eq lc("upstream")) {
+        $upstream_repo = shift @ARGV;
+      } elsif ($1 eq lc("fork")) {
+        $cloned_repo = shift @ARGV;
+      } elsif ($1 eq lc("branch")) {
+        $upstream_branch = shift @ARGV;
+      }
+    } else {
+      last;
+    }
+  }
+
+  if ($ARGV[0] !~ m|\.patch$|) {
+    die "The patch file $ARGV[0] must must have extension .patch";
+  }
+}
+
+sub get_patch_file_name($) {
+  my $url = shift;
+  $url =~ s|(^.*)[/\\]([^/\\]+)$|$2|;
+  return $url;
+}
+
+sub get_review_branch_name($) {
+  my $review_branch = shift;
+  $review_branch =~ s|\.patch$||;
+  $review_branch =~ s|\.|_|g;
+  $verbose_output && print " >> The branch name is $review_branch\n ";
+  return $review_branch;
+}
+
+sub fetch_upstream($) {
+  my $remote = shift;
+  system("git", "fetch", "-q", "$remote")
+      and die " >> Failed to update remote $remote";
+}
+
+sub create_review_branch($;$;$) {
+  my $review_branch = shift;
+  my $upstream = shift;
+  my $upstream_branch = shift;
+  system("git", "checkout", "-q", "-b", "$review_branch",
+         "${upstream}/${upstream_branch}")
+      and die " >> Failed to create code review branch $review_branch";
+}
+
+sub apply_patch($) {
+  $verbose_output && print " >> Applying patch...\n";
+  my $patch_file = shift;
+  my @options = ("--whitespace=fix", "--3way");
+
+  # The patch was generated with 'patch -p0' if it does not have either of the
+  # following patterns: '^--- a/' and '+++ b/'
+  if (!fgrep { m/^[-+]{3} [ab]\// } $patch_file) { push(@options, "-p0"); }
+
+  my @apply_command = ("git", "apply", @options, "$patch_file");
+  my $apply_command_str = join(" ", @apply_command);
+  my $op = qx($apply_command_str);
+  $? and die " >> Failed to apply $patch_file";
+  unlink $patch_file;  # Delete the downloaded patch file.
+}
+
+sub commit_patch($) {
+  $verbose_output && print " >> Committing patch...\n";
+  my $patch_file = shift;
+  system("git", "add", "--all", ".")
+      and die " >> Failed to stage patch changes";
+  system("git", "commit", "-q", "-m", "Committing $patch_file")
+      and die " >> Failed to commit $patch_file";
+}
+
+sub push_review_branch($;$) {
+  my $cloned_repo = shift;
+  my $review_branch = shift;
+  $verbose_output && print " >> Pushing branch $review_branch...\n";
+  system("git", "branch", "--unset-upstream");
+  system("git", "push", "-q", "$cloned_repo", "$review_branch")
+      and die " >> Failed to push to ${cloned_repo}:${review_branch}";
+}
+
+# Execution begins here ---------------------------------------------------
+#
+#
+if (scalar @ARGV == 0) {
+  usage();
+  exit(-1);
+}
+
+parse_args();
+my $patch_file = get_patch_file_name($ARGV[0]);
+download_file($ARGV[0], $patch_file);
+
+my $review_branch = get_review_branch_name($patch_file);
+fetch_upstream($upstream_repo);
+
+create_review_branch($review_branch, $upstream_repo, $upstream_branch);
+apply_patch($patch_file);
+commit_patch($patch_file);
+push_review_branch($cloned_repo, $review_branch);
+
+print " >> Branch ${cloned_repo}/${review_branch} is ready for review\n";

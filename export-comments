@@ -1,0 +1,91 @@
+#!/usr/bin/perl
+
+#   Copyright 2014 arp@apache.org
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+# Given the URL of a Github commit with notes, parse the page to
+# generate output suitable for posting on an Apache Jira.
+# Uses the Github REST API.
+#   Usage: export-comments <Github comments URL>
+#
+# Install modules as follows:
+#    - cpan App::cpanminus
+#    - sudo cpanm Mozilla::CA
+#    - sudo cpanm JSON::Parse
+
+use strict;
+use warnings;
+
+use File::Basename;
+use File::Spec;
+use JSON::Parse 'parse_json';
+require LWP::UserAgent;
+
+sub verify_args() {
+  if (scalar @ARGV != 1) {
+    printf STDERR " Parse Github commmit notes.\n";
+    printf STDERR "  Usage: %s <commit URL>\n", basename($0);
+    exit 1;
+  }
+}
+
+# Parse a commit URL, returning an array containing the
+# user, repo and commit reference id respectively.
+#
+sub parse_github_url($) {
+  my $url = shift;
+  if ($url =~ m|^https://github.com/(\w+)/(\w+)/commit/(\w+)|) {
+    return ($1, $2, $3);
+  } else {
+    die "Unable to parse as a Github commit URL";
+  }
+}
+
+# Given an array containing the Github user, repo and ref, return
+# a Github API path to fetch the commit notes.
+#
+sub make_api_path(@) {
+  my @components = @_;
+  return "https://api.github.com/repos/$components[0]/$components[1]/commits/$components[2]/comments";
+}
+
+sub fetch_json($) {
+  my $url = shift;
+  my $ua = LWP::UserAgent->new;
+  $ua->timeout(10);
+  my $raw = $ua->get($url) or die "Failed to fetch $url";
+  return $raw;
+}
+
+# Execution begins here  ------------------------------------------------
+#
+verify_args();
+print "Comments also posted at $ARGV[0]\n\n";
+my $api_path = make_api_path(parse_github_url($ARGV[0]));
+my $raw = fetch_json($api_path);
+my $parsed = parse_json($raw->decoded_content);
+
+# An array of path:line:comment entries.
+my @comments;
+
+foreach my $entry (@{$parsed}) {
+  my $path = exists($entry->{"path"}) ? $entry->{"path"} : "";
+  my $line = exists($entry->{"line"}) ? $entry->{"line"} : "";
+  my $body = $entry->{"body"};
+  $path =~ s|^.*/||;
+  push(@comments, "# $path:$line: $body\n");
+}
+
+my @sorted_comments = sort @comments;
+print @sorted_comments;
